@@ -11,9 +11,12 @@ ScreenCaptureKit captures the FaceTime window and streams its frames into an `AV
 Requires macOS 14+ and Xcode's command-line tools.
 
 ```bash
-./build.sh
-open "build/FaceTime PiP.app"
+./build.sh --install
 ```
+
+For custom icons, put a square `Icons/AppIcon.png` (ideally 1024×1024) and a black-on-transparent `Icons/MenuBarIcon.png` in the project before building; without them the app uses the default app icon and a video symbol in the menu bar.
+
+This builds the app, copies it to `/Applications`, and launches it (quitting any running copy first). Plain `./build.sh` just builds into `build/`.
 
 On first launch, allow **Screen Recording** for FaceTime PiP in System Settings → Privacy & Security, then reopen the app.
 

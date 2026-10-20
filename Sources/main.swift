@@ -675,7 +675,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.image = NSImage(systemSymbolName: "video.fill", accessibilityDescription: "FaceTime PiP")
+        statusItem.button?.image = Self.menuBarIcon()
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
@@ -711,6 +711,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.scheduleChecks(reason: "FaceTime activated")
         }
         checkForCall()
+    }
+
+    /// The custom menu bar icon (Icons/MenuBarIcon.png, bundled as a template image so
+    /// it follows light/dark menu bars), or a video symbol if none was provided.
+    private static func menuBarIcon() -> NSImage? {
+        if let url = Bundle.main.url(forResource: "MenuBarIcon", withExtension: "png"),
+           let image = NSImage(contentsOf: url) {
+            let height: CGFloat = 18
+            let aspect = image.size.height > 0 ? image.size.width / image.size.height : 1
+            image.size = NSSize(width: (height * aspect).rounded(), height: height)
+            image.isTemplate = true
+            image.accessibilityDescription = "FaceTime PiP"
+            return image
+        }
+        return NSImage(systemSymbolName: "video.fill", accessibilityDescription: "FaceTime PiP")
     }
 
     func applicationWillTerminate(_ notification: Notification) {
