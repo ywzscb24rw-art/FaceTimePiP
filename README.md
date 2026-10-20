@@ -25,7 +25,8 @@ On first launch, allow **Screen Recording** for FaceTime PiP in System Settings 
 - Drag the video to move it; drag an edge to resize.
 - Double-click the video to jump to FaceTime.
 - Hover and click **×** (or click the Dock icon) to return the video to the main window.
+- Hover for **mute** and **hang up** buttons. These press FaceTime's own controls through the Accessibility API, so the app asks for **Accessibility** permission the first time you use them.
 
-Keep FaceTime's window open (not minimized) — the capture can't see minimized windows. It's video only; call audio and controls stay in FaceTime.
+Keep FaceTime's window open (not minimized) — the capture can't see minimized windows. It's video only; call audio stays in FaceTime.
 
 Logs go to `~/Library/Logs/FaceTimePiP.log`.

@@ -186,6 +186,111 @@ final class SampleBufferView: NSView {
 }
 
 
+// MARK: - FaceTime controls
+
+/// Presses FaceTime's own mute and end-call controls through the Accessibility API
+/// (FaceTime has no scripting support for calls). Needs the Accessibility permission.
+/// Matches FaceTime's English UI titles.
+enum FaceTimeControls {
+    static var isTrusted: Bool { AXIsProcessTrusted() }
+
+    /// Shows the system prompt that sends the user to the Accessibility settings.
+    static func requestTrust() {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+    }
+
+    /// Toggles FaceTime's Video → Mute menu item. Returns false if it couldn't.
+    @discardableResult
+    static func toggleMute() -> Bool {
+        guard let item = muteMenuItem() else { return false }
+        return AXUIElementPerformAction(item, kAXPressAction as CFString) == .success
+    }
+
+    /// Whether FaceTime is muted (Video → Mute is checked), or nil if unknown.
+    static func isMuted() -> Bool? {
+        guard let item = muteMenuItem() else { return nil }
+        if title(of: item) == "Unmute" { return true }
+        let mark: String? = attribute(item, kAXMenuItemMarkCharAttribute)
+        return !(mark ?? "").isEmpty
+    }
+
+    /// Ends the call: presses FaceTime's end-call button if it can find one,
+    /// otherwise closes the call window. Returns false if it couldn't do either.
+    @discardableResult
+    static func hangUp() -> Bool {
+        guard let app = faceTimeApp() else { return false }
+        let windows: [AXUIElement] = attribute(app, kAXWindowsAttribute) ?? []
+
+        let endTitles: Set<String> = ["end", "end call", "leave", "leave call", "hang up"]
+        for window in windows {
+            if let button = findElement(in: window, depth: 0, where: { element in
+                guard role(of: element) == kAXButtonRole as String else { return false }
+                let label = (title(of: element) ?? description(of: element) ?? "").lowercased()
+                return endTitles.contains(label)
+            }) {
+                log("hang up: pressing end-call button")
+                return AXUIElementPerformAction(button, kAXPressAction as CFString) == .success
+            }
+        }
+
+        // No end-call button exposed (FaceTime hides its controls until hovered):
+        // close the largest window, which is the call.
+        let callWindow = windows.max { area(of: $0) < area(of: $1) }
+        if let callWindow, let close: AXUIElement = attribute(callWindow, kAXCloseButtonAttribute) {
+            log("hang up: closing the call window")
+            return AXUIElementPerformAction(close, kAXPressAction as CFString) == .success
+        }
+        return false
+    }
+
+    // MARK: Accessibility helpers
+
+    private static func faceTimeApp() -> AXUIElement? {
+        NSRunningApplication.runningApplications(withBundleIdentifier: faceTimeBundleID).first
+            .map { AXUIElementCreateApplication($0.processIdentifier) }
+    }
+
+    private static func muteMenuItem() -> AXUIElement? {
+        guard let app = faceTimeApp(),
+              let menuBar: AXUIElement = attribute(app, kAXMenuBarAttribute),
+              let videoMenu = children(of: menuBar).first(where: { title(of: $0) == "Video" }),
+              let menu = children(of: videoMenu).first
+        else { return nil }
+        return children(of: menu).first { ["Mute", "Unmute"].contains(title(of: $0)) }
+    }
+
+    private static func findElement(in element: AXUIElement, depth: Int, where match: (AXUIElement) -> Bool) -> AXUIElement? {
+        if match(element) { return element }
+        guard depth < 12 else { return nil }
+        for child in children(of: element) {
+            if let found = findElement(in: child, depth: depth + 1, where: match) { return found }
+        }
+        return nil
+    }
+
+    private static func attribute<T>(_ element: AXUIElement, _ name: String) -> T? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
+        return value as? T
+    }
+
+    private static func children(of element: AXUIElement) -> [AXUIElement] {
+        attribute(element, kAXChildrenAttribute) ?? []
+    }
+
+    private static func title(of element: AXUIElement) -> String? { attribute(element, kAXTitleAttribute) }
+    private static func description(of element: AXUIElement) -> String? { attribute(element, kAXDescriptionAttribute) }
+    private static func role(of element: AXUIElement) -> String? { attribute(element, kAXRoleAttribute) }
+
+    private static func area(of window: AXUIElement) -> CGFloat {
+        guard let value: AXValue = attribute(window, kAXSizeAttribute) else { return 0 }
+        var size = CGSize.zero
+        AXValueGetValue(value, .cgSize, &size)
+        return size.width * size.height
+    }
+}
+
 // MARK: - Floating window
 
 /// The edge or corner of the floating window under a point, where dragging resizes
@@ -270,13 +375,19 @@ final class HoverView: NSView {
 /// A small rounded video window that floats above every app, on every Space,
 /// without taking focus. Drag to move (it springs back on-screen if dropped past a
 /// display edge), drag an edge to resize, double-click to jump to FaceTime, hover
-/// for the close button.
+/// for the close, mute and hang-up buttons.
 final class FloatingVideoPanel: NSPanel {
     var onClose: (() -> Void)?
     var onDoubleClick: (() -> Void)?
+    var onToggleMute: (() -> Void)?
+    var onHangUp: (() -> Void)?
 
     private let hoverView = HoverView()
     private let closeButton = NSButton()
+    private let muteButton = FloatingVideoPanel.callButton(symbol: "mic.fill", color: NSColor(white: 0.2, alpha: 0.85))
+    private let hangUpButton = FloatingVideoPanel.callButton(symbol: "phone.down.fill", color: .systemRed)
+    /// The hover controls; clicks on them never start a drag.
+    private var controls: [NSView] { [closeButton, muteButton, hangUpButton] }
 
     /// Where a drag started: the pointer (screen coordinates) and the window origin.
     private var dragStart: (mouse: NSPoint, origin: NSPoint)?
@@ -309,7 +420,7 @@ final class FloatingVideoPanel: NSPanel {
         hoverView.onHover = { [weak self] inside in
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.15
-                self?.closeButton.animator().alphaValue = inside ? 1 : 0
+                self?.controls.forEach { $0.animator().alphaValue = inside ? 1 : 0 }
             }
         }
         contentView = hoverView
@@ -326,6 +437,22 @@ final class FloatingVideoPanel: NSPanel {
         closeButton.autoresizingMask = [.maxXMargin, .minYMargin]
         hoverView.addSubview(closeButton)
 
+        // Mute and hang up, centered along the bottom.
+        let size: CGFloat = 32, gap: CGFloat = 16
+        muteButton.frame = NSRect(x: width / 2 - size - gap / 2, y: 10, width: size, height: size)
+        hangUpButton.frame = NSRect(x: width / 2 + gap / 2, y: 10, width: size, height: size)
+        muteButton.toolTip = "Mute"
+        hangUpButton.toolTip = "End call"
+        muteButton.target = self
+        muteButton.action = #selector(muteClicked)
+        hangUpButton.target = self
+        hangUpButton.action = #selector(hangUpClicked)
+        for button in [muteButton, hangUpButton] {
+            button.alphaValue = 0
+            button.autoresizingMask = [.minXMargin, .maxXMargin, .maxYMargin]
+            hoverView.addSubview(button)
+        }
+
         // Start in the bottom-right corner of the main screen.
         if let visible = NSScreen.main?.visibleFrame {
             setFrameOrigin(NSPoint(x: visible.maxX - width - 20, y: visible.minY + 20))
@@ -336,8 +463,29 @@ final class FloatingVideoPanel: NSPanel {
         }
     }
 
-    // Lets the close button work on the first click without activating the app.
+    // Lets the buttons work on the first click without activating the app.
     override var canBecomeKey: Bool { true }
+
+    /// Shows FaceTime's mute state on the mute button (nil = unknown).
+    func setMuted(_ muted: Bool?) {
+        let symbol = muted == true ? "mic.slash.fill" : "mic.fill"
+        muteButton.image = NSImage(systemSymbolName: symbol, accessibilityDescription: muted == true ? "Unmute" : "Mute")
+        muteButton.toolTip = muted == true ? "Unmute" : "Mute"
+        muteButton.layer?.backgroundColor = (muted == true ? NSColor.white : NSColor(white: 0.2, alpha: 0.85)).cgColor
+        muteButton.contentTintColor = muted == true ? .black : .white
+    }
+
+    private static func callButton(symbol: String, color: NSColor) -> NSButton {
+        let button = NSButton()
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        button.symbolConfiguration = .init(pointSize: 14, weight: .semibold)
+        button.isBordered = false
+        button.contentTintColor = .white
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 16
+        button.layer?.backgroundColor = color.cgColor
+        return button
+    }
 
     /// Shows `view` filling the window, under the controls.
     func host(_ view: NSView) {
@@ -355,7 +503,7 @@ final class FloatingVideoPanel: NSPanel {
             }
             let point = event.locationInWindow
             // Edges and corners are left to the system, which resizes the window.
-            if ResizeZone(point: point, in: hoverView.bounds) == nil, !closeButton.frame.contains(point) {
+            if ResizeZone(point: point, in: hoverView.bounds) == nil, !controls.contains(where: { $0.frame.contains(point) }) {
                 dragStart = (NSEvent.mouseLocation, frame.origin)
                 return
             }
@@ -412,6 +560,14 @@ final class FloatingVideoPanel: NSPanel {
     @objc private func closeClicked() {
         onClose?()
     }
+
+    @objc private func muteClicked() {
+        onToggleMute?()
+    }
+
+    @objc private func hangUpClicked() {
+        onHangUp?()
+    }
 }
 
 // MARK: - App
@@ -423,6 +579,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let videoView = SampleBufferView(frame: NSRect(x: 0, y: 0, width: 396, height: 270))
     private var capturer: WindowCapturer!
     private var panel: FloatingVideoPanel?
+    private var muteTimer: Timer?
 
     private let popButton = NSButton(title: "Pop Out", target: nil, action: nil)
     private let connectButton = NSButton(title: "Connect to FaceTime", target: nil, action: nil)
@@ -599,12 +756,27 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.onDoubleClick = {
             NSRunningApplication.runningApplications(withBundleIdentifier: faceTimeBundleID).first?.activate()
         }
+        panel.onToggleMute = { [weak self] in
+            guard self?.ensureAccessibility() == true else { return }
+            if !FaceTimeControls.toggleMute() { log("mute: couldn't find FaceTime's Mute menu item") }
+            self?.refreshMuteState()
+        }
+        panel.onHangUp = { [weak self] in
+            guard self?.ensureAccessibility() == true else { return }
+            if !FaceTimeControls.hangUp() { log("hang up: couldn't find a way to end the call") }
+        }
         videoView.removeFromSuperview()
         panel.host(videoView)
         panel.orderFrontRegardless()
         self.panel = panel
 
         window.orderOut(nil)
+
+        // Keep the mute button in sync with FaceTime, including changes made there.
+        refreshMuteState()
+        muteTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.refreshMuteState()
+        }
         log("popped out")
         setStatus("Showing in the floating window.")
         refreshButtons()
@@ -612,6 +784,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func returnToWindow() {
         guard let panel else { return }
+        muteTimer?.invalidate()
+        muteTimer = nil
         panel.orderOut(nil)
         self.panel = nil
         hostVideoInWindow()
@@ -621,6 +795,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         log("returned to window")
         setStatus(capturer.isRunning ? "Mirroring FaceTime. Click Pop Out for a floating window." : statusLabel.stringValue)
         refreshButtons()
+    }
+
+    private func refreshMuteState() {
+        panel?.setMuted(FaceTimeControls.isTrusted ? FaceTimeControls.isMuted() : nil)
+    }
+
+    /// The call buttons need the Accessibility permission; asks for it if missing.
+    private func ensureAccessibility() -> Bool {
+        if FaceTimeControls.isTrusted { return true }
+        log("asking for Accessibility permission")
+        FaceTimeControls.requestTrust()
+        return false
     }
 
     private func captureEnded() {
