@@ -175,9 +175,6 @@ final class SampleBufferView: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    // Dragging the video drags the floating window.
-    override var mouseDownCanMoveWindow: Bool { true }
-
     override func layout() {
         super.layout()
         guard bounds.width > 0, bounds.height > 0 else { return }
@@ -191,29 +188,100 @@ final class SampleBufferView: NSView {
 
 // MARK: - Floating window
 
-/// Tells the floating window when the pointer enters or leaves, to show its controls.
+/// The edge or corner of the floating window under a point, where dragging resizes
+/// instead of moves. Borderless windows resize but don't show resize cursors, so
+/// the window draws its own using these zones.
+enum ResizeZone {
+    case top, bottom, left, right, topLeft, topRight, bottomLeft, bottomRight
+
+    static let edgeWidth: CGFloat = 6
+    static let cornerSize: CGFloat = 10
+
+    init?(point p: NSPoint, in bounds: NSRect) {
+        let left = p.x - bounds.minX, right = bounds.maxX - p.x
+        let bottom = p.y - bounds.minY, top = bounds.maxY - p.y
+        let c = Self.cornerSize, e = Self.edgeWidth
+        switch true {
+        case top < c && left < c: self = .topLeft
+        case top < c && right < c: self = .topRight
+        case bottom < c && left < c: self = .bottomLeft
+        case bottom < c && right < c: self = .bottomRight
+        case top < e: self = .top
+        case bottom < e: self = .bottom
+        case left < e: self = .left
+        case right < e: self = .right
+        default: return nil
+        }
+    }
+
+    var cursor: NSCursor {
+        if #available(macOS 15.0, *) {
+            let position: NSCursor.FrameResizePosition = switch self {
+            case .top: .top
+            case .bottom: .bottom
+            case .left: .left
+            case .right: .right
+            case .topLeft: .topLeft
+            case .topRight: .topRight
+            case .bottomLeft: .bottomLeft
+            case .bottomRight: .bottomRight
+            }
+            return .frameResize(position: position, directions: .all)
+        }
+        switch self {
+        case .top, .bottom: return .resizeUpDown
+        case .left, .right: return .resizeLeftRight
+        default: return .crosshair  // no diagonal resize cursor before macOS 15
+        }
+    }
+}
+
+/// Tells the floating window when the pointer enters or leaves (to show its
+/// controls) and shows resize cursors over its edges.
 final class HoverView: NSView {
     var onHover: ((Bool) -> Void)?
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         trackingAreas.forEach(removeTrackingArea)
-        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect], owner: self))
     }
 
-    override func mouseEntered(with event: NSEvent) { onHover?(true) }
-    override func mouseExited(with event: NSEvent) { onHover?(false) }
+    override func mouseEntered(with event: NSEvent) {
+        onHover?(true)
+        updateCursor(for: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onHover?(false)
+        NSCursor.arrow.set()
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        updateCursor(for: event)
+    }
+
+    private func updateCursor(for event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        (ResizeZone(point: point, in: bounds)?.cursor ?? .arrow).set()
+    }
 }
 
 /// A small rounded video window that floats above every app, on every Space,
-/// without taking focus. Drag to move, drag an edge to resize, double-click to
-/// jump to FaceTime, hover for the close button.
+/// without taking focus. Drag to move (it springs back on-screen if dropped past a
+/// display edge), drag an edge to resize, double-click to jump to FaceTime, hover
+/// for the close button.
 final class FloatingVideoPanel: NSPanel {
     var onClose: (() -> Void)?
     var onDoubleClick: (() -> Void)?
 
     private let hoverView = HoverView()
     private let closeButton = NSButton()
+
+    /// Where a drag started: the pointer (screen coordinates) and the window origin.
+    private var dragStart: (mouse: NSPoint, origin: NSPoint)?
+    /// Gap kept from the display edge after springing back.
+    private let edgeMargin: CGFloat = 12
 
     init(aspectRatio: CGSize) {
         let width: CGFloat = 320
@@ -225,7 +293,7 @@ final class FloatingVideoPanel: NSPanel {
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         isFloatingPanel = true
         hidesOnDeactivate = false
-        isMovableByWindowBackground = true
+        isMovableByWindowBackground = false  // dragging is handled in sendEvent
         isReleasedWhenClosed = false
         backgroundColor = .clear
         isOpaque = false
@@ -262,6 +330,10 @@ final class FloatingVideoPanel: NSPanel {
         if let visible = NSScreen.main?.visibleFrame {
             setFrameOrigin(NSPoint(x: visible.maxX - width - 20, y: visible.minY + 20))
         }
+
+        NotificationCenter.default.addObserver(forName: NSWindow.didEndLiveResizeNotification, object: self, queue: .main) { [weak self] _ in
+            self?.moveBackOnScreen()
+        }
     }
 
     // Lets the close button work on the first click without activating the app.
@@ -275,11 +347,66 @@ final class FloatingVideoPanel: NSPanel {
     }
 
     override func sendEvent(_ event: NSEvent) {
-        if event.type == .leftMouseDown, event.clickCount == 2 {
-            onDoubleClick?()
-            return
+        switch event.type {
+        case .leftMouseDown:
+            if event.clickCount == 2 {
+                onDoubleClick?()
+                return
+            }
+            let point = event.locationInWindow
+            // Edges and corners are left to the system, which resizes the window.
+            if ResizeZone(point: point, in: hoverView.bounds) == nil, !closeButton.frame.contains(point) {
+                dragStart = (NSEvent.mouseLocation, frame.origin)
+                return
+            }
+        case .leftMouseDragged:
+            if let start = dragStart {
+                let mouse = NSEvent.mouseLocation
+                setFrameOrigin(NSPoint(x: start.origin.x + mouse.x - start.mouse.x,
+                                       y: start.origin.y + mouse.y - start.mouse.y))
+                return
+            }
+        case .leftMouseUp:
+            if dragStart != nil {
+                dragStart = nil
+                moveBackOnScreen()
+                return
+            }
+        default:
+            break
         }
         super.sendEvent(event)
+    }
+
+    /// If any part of the window hangs past the edge of its display, slides it back
+    /// against the nearest edge(s). Leaves it alone when it's fully on-screen.
+    private func moveBackOnScreen() {
+        guard let visible = displayForWindow()?.visibleFrame, !visible.contains(frame) else { return }
+
+        let area = visible.insetBy(dx: edgeMargin, dy: edgeMargin)
+        var target = frame
+        target.origin.x = min(max(target.minX, area.minX), area.maxX - target.width)
+        target.origin.y = min(max(target.minY, area.minY), area.maxY - target.height)
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.25
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            animator().setFrame(target, display: true)
+        }
+    }
+
+    /// The display showing most of the window, or the one under the pointer if it's
+    /// been dragged entirely off every display.
+    private func displayForWindow() -> NSScreen? {
+        let overlap = { (screen: NSScreen) -> CGFloat in
+            let shared = screen.frame.intersection(self.frame)
+            return shared.isNull ? 0 : shared.width * shared.height
+        }
+        if let best = NSScreen.screens.max(by: { overlap($0) < overlap($1) }), overlap(best) > 0 {
+            return best
+        }
+        let mouse = NSEvent.mouseLocation
+        return NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
     }
 
     @objc private func closeClicked() {
