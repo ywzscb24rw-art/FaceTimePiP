@@ -1,13 +1,15 @@
-// FaceTime PiP — mirrors the FaceTime window into a small floating window that
-// stays on top of every app and Space.
+// FaceTime PiP — a menu bar app that appears while you're on a FaceTime call and
+// can mirror the call into a small floating window on top of every app and Space.
 //
 // ScreenCaptureKit streams the FaceTime window's frames into an
-// AVSampleBufferDisplayLayer, shown either in the main window or in the floating one.
+// AVSampleBufferDisplayLayer shown in the floating window.
 
 import AppKit
 import AVFoundation
+import CoreAudio
 import CoreMedia
 import ScreenCaptureKit
+import ServiceManagement
 
 let faceTimeBundleID = "com.apple.FaceTime"
 
@@ -207,6 +209,15 @@ enum FaceTimeControls {
         return AXUIElementPerformAction(item, kAXPressAction as CFString) == .success
     }
 
+    /// Whether a FaceTime call is in progress, or nil if that can't be read (no
+    /// Accessibility permission). FaceTime only enables Video → Mute during a call.
+    static func isInCall() -> Bool? {
+        guard isTrusted else { return nil }
+        guard let item = muteMenuItem() else { return false }
+        let enabled: Bool? = attribute(item, kAXEnabledAttribute)
+        return enabled ?? false
+    }
+
     /// Whether FaceTime is muted (Video → Mute is checked), or nil if unknown.
     static func isMuted() -> Bool? {
         guard let item = muteMenuItem() else { return nil }
@@ -242,6 +253,26 @@ enum FaceTimeControls {
             return AXUIElementPerformAction(close, kAXPressAction as CFString) == .success
         }
         return false
+    }
+
+    /// Whether any app is using the default microphone (fallback call detection).
+    static func isMicrophoneInUse() -> Bool {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice,
+                                                 mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var device = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device) == noErr
+        else { return false }
+        address.mSelector = kAudioDevicePropertyDeviceIsRunningSomewhere
+        var running: UInt32 = 0
+        size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &running) == noErr else { return false }
+        return running != 0
+    }
+
+    static var isFaceTimeRunning: Bool {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: faceTimeBundleID).isEmpty
     }
 
     // MARK: Accessibility helpers
@@ -425,11 +456,11 @@ final class FloatingVideoPanel: NSPanel {
         }
         contentView = hoverView
 
-        closeButton.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Return to window")
+        closeButton.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Close")
         closeButton.isBordered = false
         closeButton.contentTintColor = .white
         closeButton.symbolConfiguration = .init(pointSize: 18, weight: .regular)
-        closeButton.toolTip = "Return to window"
+        closeButton.toolTip = "Close"
         closeButton.target = self
         closeButton.action = #selector(closeClicked)
         closeButton.alphaValue = 0
@@ -570,238 +601,257 @@ final class FloatingVideoPanel: NSPanel {
     }
 }
 
+// MARK: - Microphone watcher
+
+/// Calls `onChange` whenever the default microphone starts or stops being used by
+/// any app, following changes of the default input device. Event-driven: costs
+/// nothing between changes.
+final class MicrophoneWatcher {
+    private let onChange: () -> Void
+    private var device = AudioDeviceID(0)
+    private let queue = DispatchQueue.main
+
+    private var defaultDeviceAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    private var runningAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+
+    private lazy var deviceChanged: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+        self?.watchDefaultDevice()
+        self?.onChange()
+    }
+    private lazy var runningChanged: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+        self?.onChange()
+    }
+
+    init(onChange: @escaping () -> Void) {
+        self.onChange = onChange
+        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &defaultDeviceAddress, queue, deviceChanged)
+        watchDefaultDevice()
+    }
+
+    private func watchDefaultDevice() {
+        if device != 0 {
+            AudioObjectRemovePropertyListenerBlock(device, &runningAddress, queue, runningChanged)
+        }
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var newDevice = AudioDeviceID(0)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &defaultDeviceAddress, 0, nil, &size, &newDevice) == noErr,
+              newDevice != 0
+        else { device = 0; return }
+        device = newDevice
+        AudioObjectAddPropertyListenerBlock(device, &runningAddress, queue, runningChanged)
+    }
+}
+
 // MARK: - App
 
-final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
+/// Lives in the menu bar (no Dock icon). The menu bar icon shows only while a
+/// FaceTime call is in progress, or briefly after the app is opened by hand.
+///
+/// Call detection is event-driven: microphone start/stop and FaceTime
+/// launch/quit/activation trigger a check. Only during a call does it re-check on
+/// a timer (to keep mute in sync and notice the call ending).
+final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
-    private var window: NSWindow!
-    private let videoContainer = NSView()
-    private let videoView = SampleBufferView(frame: NSRect(x: 0, y: 0, width: 396, height: 270))
+    private var statusItem: NSStatusItem!
+    private let videoView = SampleBufferView(frame: NSRect(x: 0, y: 0, width: 320, height: 200))
     private var capturer: WindowCapturer!
     private var panel: FloatingVideoPanel?
-    private var muteTimer: Timer?
-
-    private let popButton = NSButton(title: "Pop Out", target: nil, action: nil)
-    private let connectButton = NSButton(title: "Connect to FaceTime", target: nil, action: nil)
-    private let statusLabel = NSTextField(labelWithString: "")
-
-    private var isPoppedOut: Bool { panel != nil }
+    private var isOpeningPanel = false
+    private var micWatcher: MicrophoneWatcher?
+    private var appsObservation: NSKeyValueObservation?
+    private var faceTimeWasRunning = false
+    private var callTimer: Timer?
+    private var pendingChecks: [DispatchWorkItem] = []
+    private var inCall = false
+    /// Keeps the icon visible for a moment after a manual launch/reopen, so the
+    /// menu (Launch at Login, Quit) is reachable outside a call.
+    private var showIconUntil: Date?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        buildWindow()
-        buildMenu()
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem.button?.image = NSImage(systemSymbolName: "video.fill", accessibilityDescription: "FaceTime PiP")
+        let menu = NSMenu()
+        menu.delegate = self
+        statusItem.menu = menu
 
         capturer = WindowCapturer(layer: videoView.displayLayer)
         capturer.onStop = { [weak self] error in
             log("capture stopped: \(String(describing: error))")
-            self?.captureEnded()
-        }
-        capturer.onFirstFrame = { [weak self] in
-            log("first frame received")
-            self?.refreshButtons()
+            self?.closePanel()
+            self?.scheduleChecks(reason: "capture stopped")
         }
 
-        log("launched; screen capture access: \(CGPreflightScreenCaptureAccess())")
-        NSApp.activate(ignoringOtherApps: true)
-        connect()
+        log("launched; screen capture: \(CGPreflightScreenCaptureAccess()), accessibility: \(FaceTimeControls.isTrusted)")
+        if !FaceTimeControls.isTrusted { FaceTimeControls.requestTrust() }
+
+        showIconBriefly()
+        micWatcher = MicrophoneWatcher { [weak self] in self?.scheduleChecks(reason: "microphone") }
+        // FaceTime launching or quitting (the workspace terminate notification isn't
+        // reliable, so watch the running-apps list).
+        faceTimeWasRunning = FaceTimeControls.isFaceTimeRunning
+        appsObservation = NSWorkspace.shared.observe(\.runningApplications) { [weak self] _, _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let running = FaceTimeControls.isFaceTimeRunning
+                guard running != self.faceTimeWasRunning else { return }
+                self.faceTimeWasRunning = running
+                self.scheduleChecks(reason: running ? "FaceTime launched" : "FaceTime quit")
+            }
+        }
+        // FaceTime coming to the front, e.g. after answering a call.
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            guard app?.bundleIdentifier == faceTimeBundleID else { return }
+            self?.scheduleChecks(reason: "FaceTime activated")
+        }
+        checkForCall()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         log("terminating")
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        !isPoppedOut
-    }
-
-    // Clicking the Dock icon brings the video back to the main window.
+    // Opening the app again (Finder, Spotlight) shows the icon for a moment.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if isPoppedOut { returnToWindow() } else { window.makeKeyAndOrderFront(nil) }
-        return true
+        showIconBriefly()
+        return false
     }
 
-    // MARK: UI
+    private func showIconBriefly() {
+        showIconUntil = Date().addingTimeInterval(15)
+        updateIcon()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15.1) { [weak self] in self?.updateIcon() }
+    }
 
-    private func buildWindow() {
-        window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 330),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered, defer: false)
-        window.title = "FaceTime PiP"
-        window.minSize = NSSize(width: 320, height: 260)
-        window.isReleasedWhenClosed = false
-        window.delegate = self
+    // MARK: Call detection
 
-        let content = NSView()
-        window.contentView = content
-
-        let video = videoContainer
-        video.wantsLayer = true
-        video.layer?.backgroundColor = NSColor.black.cgColor
-        video.layer?.cornerRadius = 8
-        video.layer?.masksToBounds = true
-        hostVideoInWindow()
-
-        popButton.target = self
-        popButton.action = #selector(togglePopOut)
-        popButton.bezelStyle = .rounded
-        popButton.keyEquivalent = "\r"
-        connectButton.target = self
-        connectButton.action = #selector(connect)
-        connectButton.bezelStyle = .rounded
-
-        statusLabel.textColor = .secondaryLabelColor
-        statusLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-        statusLabel.lineBreakMode = .byWordWrapping
-        statusLabel.maximumNumberOfLines = 2
-
-        let buttons = NSStackView(views: [connectButton, popButton])
-        buttons.spacing = 8
-
-        for view in [video, buttons, statusLabel] as [NSView] {
-            view.translatesAutoresizingMaskIntoConstraints = false
-            content.addSubview(view)
+    /// Checks now and again shortly after: FaceTime can take a moment to enable its
+    /// Mute menu item once the microphone or app state changes.
+    private func scheduleChecks(reason: String) {
+        log("checking for call (\(reason))")
+        pendingChecks.forEach { $0.cancel() }
+        pendingChecks = [0, 1, 3].map { delay in
+            let work = DispatchWorkItem { [weak self] in self?.checkForCall() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+            return work
         }
-        NSLayoutConstraint.activate([
-            video.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
-            video.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
-            video.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
-            buttons.topAnchor.constraint(equalTo: video.bottomAnchor, constant: 12),
-            buttons.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
-            statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
-            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: buttons.leadingAnchor, constant: -8),
-            statusLabel.centerYAnchor.constraint(equalTo: buttons.centerYAnchor),
-            buttons.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
-        ])
-
-        window.center()
-        window.makeKeyAndOrderFront(nil)
     }
 
-    private func hostVideoInWindow() {
-        videoView.removeFromSuperview()
-        videoView.frame = videoContainer.bounds
-        videoView.autoresizingMask = [.width, .height]
-        videoContainer.addSubview(videoView)
+    private func checkForCall() {
+        let call: Bool
+        if let detected = FaceTimeControls.isInCall() {
+            call = detected
+        } else {
+            call = FaceTimeControls.isFaceTimeRunning && FaceTimeControls.isMicrophoneInUse()
+        }
+        if call != inCall {
+            inCall = call
+            log(call ? "FaceTime call started" : "FaceTime call ended")
+            if !call { closePanel() }
+            // Re-check on a timer only while a call is in progress.
+            callTimer?.invalidate()
+            callTimer = call ? Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+                self?.checkForCall()
+            } : nil
+        }
+        updateIcon()
+        panel?.setMuted(FaceTimeControls.isTrusted ? FaceTimeControls.isMuted() : nil)
     }
 
-    private func buildMenu() {
-        let main = NSMenu()
-        let appItem = NSMenuItem()
-        main.addItem(appItem)
-        let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "Quit FaceTime PiP", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        appItem.submenu = appMenu
-        NSApp.mainMenu = main
+    private func updateIcon() {
+        let manual = showIconUntil.map { $0 > Date() } ?? false
+        statusItem.isVisible = inCall || panel != nil || manual
     }
 
-    private func setStatus(_ text: String) {
-        log("status: \(text)")
-        statusLabel.stringValue = text
+    // MARK: Menu
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+
+        let header = NSMenuItem(title: inCall ? "FaceTime call in progress" : "No FaceTime call", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+        menu.addItem(.separator())
+
+        let float = item(panel == nil ? "Show Floating Video" : "Hide Floating Video", #selector(toggleFloating))
+        float.isEnabled = (inCall || panel != nil) && !isOpeningPanel
+        menu.addItem(float)
+
+        let muted = FaceTimeControls.isTrusted ? FaceTimeControls.isMuted() : nil
+        let mute = item("Mute", #selector(toggleMute))
+        mute.state = muted == true ? .on : .off
+        mute.isEnabled = inCall
+        menu.addItem(mute)
+
+        let end = item("End Call", #selector(hangUp))
+        end.isEnabled = inCall
+        menu.addItem(end)
+
+        menu.addItem(.separator())
+        if !CGPreflightScreenCaptureAccess() {
+            menu.addItem(item("Allow Screen Recording…", #selector(openScreenRecordingSettings)))
+        }
+        if !FaceTimeControls.isTrusted {
+            menu.addItem(item("Allow Accessibility…", #selector(openAccessibilitySettings)))
+        }
+        let login = item("Launch at Login", #selector(toggleLaunchAtLogin))
+        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        menu.addItem(login)
+        menu.addItem(item("Quit FaceTime PiP", #selector(NSApplication.terminate(_:)), key: "q"))
     }
 
-    private func refreshButtons() {
-        popButton.title = isPoppedOut ? "Return to Window" : "Pop Out"
-        popButton.isEnabled = isPoppedOut || (capturer.isRunning && capturer.hasFrames)
-        connectButton.isHidden = capturer.isRunning
+    private func item(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.target = action == #selector(NSApplication.terminate(_:)) ? NSApp : self
+        return item
     }
 
     // MARK: Actions
 
-    @objc private func connect() {
-        guard !capturer.isRunning else { return }
+    @objc private func toggleFloating() {
+        if panel != nil { closePanel() } else { openPanel() }
+    }
 
-        if !CGPreflightScreenCaptureAccess() {
-            CGRequestScreenCaptureAccess()
-            setStatus("Allow Screen Recording for FaceTime PiP in System Settings → Privacy & Security, then reopen the app.")
-            refreshButtons()
-            return
-        }
+    @objc private func toggleMute() {
+        guard ensureAccessibility() else { return }
+        if !FaceTimeControls.toggleMute() { log("mute: couldn't find FaceTime's Mute menu item") }
+        panel?.setMuted(FaceTimeControls.isMuted())
+    }
 
-        setStatus("Looking for FaceTime…")
-        Task { @MainActor in
-            do {
-                let candidates = try await WindowCapturer.findFaceTimeWindows()
-                // Try each window until one actually delivers video.
-                for ftWindow in candidates {
-                    log("trying window \(ftWindow.windowID) \(ftWindow.title ?? "") \(ftWindow.frame) onScreen: \(ftWindow.isOnScreen)")
-                    try await capturer.start(window: ftWindow)
-                    for _ in 0..<30 where !capturer.hasFrames {
-                        try await Task.sleep(nanoseconds: 100_000_000)
-                    }
-                    if capturer.hasFrames {
-                        setStatus("Mirroring FaceTime. Click Pop Out for a floating window.")
-                        refreshButtons()
-                        return
-                    }
-                    log("no frames from window \(ftWindow.windowID)")
-                    capturer.stop()
-                }
-                setStatus("Open FaceTime (and don't minimize its window), then click Connect.")
-            } catch {
-                setStatus("Couldn't capture FaceTime: \(error.localizedDescription)")
+    @objc private func hangUp() {
+        guard ensureAccessibility() else { return }
+        if !FaceTimeControls.hangUp() { log("hang up: couldn't find a way to end the call") }
+    }
+
+    @objc private func openScreenRecordingSettings() {
+        CGRequestScreenCaptureAccess()
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+    }
+
+    @objc private func openAccessibilitySettings() {
+        FaceTimeControls.requestTrust()
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
             }
-            refreshButtons()
+        } catch {
+            log("launch at login: \(error.localizedDescription)")
         }
     }
 
-    @objc private func togglePopOut() {
-        if isPoppedOut { returnToWindow() } else { popOut() }
-    }
-
-    private func popOut() {
-        let size = capturer.capturedSize
-        let panel = FloatingVideoPanel(aspectRatio: size.width > 0 && size.height > 0 ? size : CGSize(width: 16, height: 10))
-        panel.onClose = { [weak self] in self?.returnToWindow() }
-        panel.onDoubleClick = {
-            NSRunningApplication.runningApplications(withBundleIdentifier: faceTimeBundleID).first?.activate()
-        }
-        panel.onToggleMute = { [weak self] in
-            guard self?.ensureAccessibility() == true else { return }
-            if !FaceTimeControls.toggleMute() { log("mute: couldn't find FaceTime's Mute menu item") }
-            self?.refreshMuteState()
-        }
-        panel.onHangUp = { [weak self] in
-            guard self?.ensureAccessibility() == true else { return }
-            if !FaceTimeControls.hangUp() { log("hang up: couldn't find a way to end the call") }
-        }
-        videoView.removeFromSuperview()
-        panel.host(videoView)
-        panel.orderFrontRegardless()
-        self.panel = panel
-
-        window.orderOut(nil)
-
-        // Keep the mute button in sync with FaceTime, including changes made there.
-        refreshMuteState()
-        muteTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            self?.refreshMuteState()
-        }
-        log("popped out")
-        setStatus("Showing in the floating window.")
-        refreshButtons()
-    }
-
-    private func returnToWindow() {
-        guard let panel else { return }
-        muteTimer?.invalidate()
-        muteTimer = nil
-        panel.orderOut(nil)
-        self.panel = nil
-        hostVideoInWindow()
-
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        log("returned to window")
-        setStatus(capturer.isRunning ? "Mirroring FaceTime. Click Pop Out for a floating window." : statusLabel.stringValue)
-        refreshButtons()
-    }
-
-    private func refreshMuteState() {
-        panel?.setMuted(FaceTimeControls.isTrusted ? FaceTimeControls.isMuted() : nil)
-    }
-
-    /// The call buttons need the Accessibility permission; asks for it if missing.
+    /// The call controls need the Accessibility permission; asks for it if missing.
     private func ensureAccessibility() -> Bool {
         if FaceTimeControls.isTrusted { return true }
         log("asking for Accessibility permission")
@@ -809,16 +859,73 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return false
     }
 
-    private func captureEnded() {
+    // MARK: Floating window
+
+    /// Starts capturing the FaceTime call window and shows it in the floating window.
+    private func openPanel() {
+        guard panel == nil, !isOpeningPanel else { return }
+        guard CGPreflightScreenCaptureAccess() else {
+            openScreenRecordingSettings()
+            return
+        }
+
+        isOpeningPanel = true
+        Task { @MainActor in
+            defer { isOpeningPanel = false }
+            do {
+                // Try each FaceTime window until one actually delivers video.
+                for ftWindow in try await WindowCapturer.findFaceTimeWindows() {
+                    log("trying window \(ftWindow.windowID) \(ftWindow.title ?? "") \(ftWindow.frame) onScreen: \(ftWindow.isOnScreen)")
+                    try await capturer.start(window: ftWindow)
+                    for _ in 0..<30 where !capturer.hasFrames {
+                        try await Task.sleep(nanoseconds: 100_000_000)
+                    }
+                    if capturer.hasFrames {
+                        showPanel()
+                        return
+                    }
+                    log("no frames from window \(ftWindow.windowID)")
+                    capturer.stop()
+                }
+                log("no FaceTime window to show")
+            } catch {
+                log("couldn't capture FaceTime: \(error.localizedDescription)")
+                capturer.stop()
+            }
+        }
+    }
+
+    private func showPanel() {
+        let size = capturer.capturedSize
+        let panel = FloatingVideoPanel(aspectRatio: size.width > 0 && size.height > 0 ? size : CGSize(width: 16, height: 10))
+        panel.onClose = { [weak self] in self?.closePanel() }
+        panel.onDoubleClick = {
+            NSRunningApplication.runningApplications(withBundleIdentifier: faceTimeBundleID).first?.activate()
+        }
+        panel.onToggleMute = { [weak self] in self?.toggleMute() }
+        panel.onHangUp = { [weak self] in self?.hangUp() }
+        panel.host(videoView)
+        panel.setMuted(FaceTimeControls.isTrusted ? FaceTimeControls.isMuted() : nil)
+        panel.orderFrontRegardless()
+        self.panel = panel
+        log("floating window shown")
+        updateIcon()
+    }
+
+    private func closePanel() {
+        capturer.stop()
         videoView.displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
-        returnToWindow()
-        setStatus("FaceTime window went away. Click Connect to try again.")
-        refreshButtons()
+        guard let panel else { return }
+        panel.orderOut(nil)
+        videoView.removeFromSuperview()
+        self.panel = nil
+        log("floating window closed")
+        updateIcon()
     }
 }
 
 let app = NSApplication.shared
 let controller = AppController()
 app.delegate = controller
-app.setActivationPolicy(.regular)
+app.setActivationPolicy(.accessory)  // menu bar only, no Dock icon
 app.run()

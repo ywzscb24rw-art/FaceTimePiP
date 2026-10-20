@@ -1,6 +1,6 @@
 # FaceTime PiP
 
-A small macOS app that mirrors your FaceTime call into a floating window that stays on top of every app and Space, like Zoom's mini video window.
+A small macOS menu bar app that appears while you're on a FaceTime call and can mirror the call into a floating window that stays on top of every app and Space, like Zoom's mini video window.
 
 ## How it works
 
@@ -21,11 +21,23 @@ On first launch, allow **Screen Recording** for FaceTime PiP in System Settings 
 
 ## Using it
 
-- **Pop Out** moves the video into the floating window.
-- Drag the video to move it; drag an edge to resize.
+The app has no Dock icon or main window. While a FaceTime call is in progress, a video icon shows in the menu bar with:
+
+- **Show Floating Video** — opens the floating window.
+- **Mute** / **End Call** — press FaceTime's own controls.
+- **Launch at Login** — start the app automatically.
+- **Quit FaceTime PiP**
+
+Outside a call the icon is hidden; opening the app again (Finder, Spotlight) shows it for 15 seconds so you can reach the menu.
+
+In the floating window:
+
+- Drag the video to move it; if you drop it past a display edge it springs back on-screen.
+- Drag an edge or corner to resize.
 - Double-click the video to jump to FaceTime.
-- Hover and click **×** (or click the Dock icon) to return the video to the main window.
-- Hover for **mute** and **hang up** buttons. These press FaceTime's own controls through the Accessibility API, so the app asks for **Accessibility** permission the first time you use them.
+- Hover for **×** (close), **mute** and **hang up** buttons.
+
+Call detection doesn't poll: microphone start/stop and FaceTime launching, quitting or coming to the front trigger a check. Call detection, mute and hang up use the Accessibility API, so the app asks for **Accessibility** permission on first launch. Without it, it falls back to treating "FaceTime is running and the microphone is in use" as a call.
 
 Keep FaceTime's window open (not minimized) — the capture can't see minimized windows. It's video only; call audio stays in FaceTime.
 
